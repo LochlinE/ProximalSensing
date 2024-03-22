@@ -1,0 +1,721 @@
+
+```{r}
+library(asdreader)
+library(tidyverse)
+library(readxl)
+library(stringr)
+library(prospectr)
+```
+
+```{r Example Spectra}
+fileStorage <- "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\asd2023\\G\\1.5.23.23\\PGC0100000.asd" 
+fileNames <- list.files(fileStorage)
+
+J11C1ref <- get_spectra(fileStorage, type = "reflectance")
+
+plot( x = c(350:2500), y = t(J11C1ref), type = 'l')
+```
+
+```{r Retrieve Multiple Spectra from a single folder}
+fileStorage <- "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\asd2023\\G\\1.5.23.23\\"
+fileNames <- list.files(fileStorage)
+
+filePaths <- paste(rep(fileStorage, length(fileNames)), fileNames, sep = "")
+
+ref <- get_spectra(filePaths, type = "reflectance") %>%
+  as.data.frame() %>%
+  `rownames<-`(fileNames)
+  
+matplot(x = c(350:2500), y = t(ref), type = 'l',
+        ylim = c(0,1))
+```
+
+```{r Retrieves Multiple Files Contained in Multiple Folders}
+
+masterFolder <- "C:/Users/lochl/OneDrive - Montana State University/Documents/SawflyResearch/Analysis/ProximalSensing2023/asd2023"
+paths <- list.files(masterFolder, full.names = T,recursive = T)
+#paths <- paths[-grep(".ini", paths, fixed = T)]
+
+refs <- get_spectra(paths, type = "reflectance") %>%
+  as.data.frame() %>%
+  `rownames<-`(paths)
+
+refs <- refs %>%
+  mutate(
+    pathNoExt = gsub("[[:digit:]]{5}[.].*", "",paths),
+    dcEvent = as.integer(sub(".*/(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)/.*", "\\1", pathNoExt)),
+    month = as.integer(sub(".*/(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)/.*", "\\2", pathNoExt)),
+    day = as.integer(sub(".*/(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)/.*", "\\3", pathNoExt)),
+    year = 2000 + (as.integer(sub(".*/(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)/.*", "\\4", pathNoExt))),
+    date = as.Date(sprintf("%04d-%02d-%02d", year, month, day)),
+    plantName = sub(".*/([^/]+)$", "\\1", pathNoExt),
+    sampleName = paste(dcEvent,plantName, sep = ""),
+    treatment = case_when(
+      substr(plantName,3,3) == "C" ~ "control",
+      substr(plantName,3,3) == "I" ~ "treatment",
+      TRUE ~ NA_character_),
+    plantingGroup = sub(".*/(\\w+)/\\d+\\.\\d+\\.\\d+\\.\\d+/.*", "\\1", pathNoExt))
+
+# calculate DAI for each plantingGroup
+refs <- refs %>%
+  group_by(plantingGroup) %>%
+  mutate(
+    DAI = as.numeric(date - min(date))) %>%
+  ungroup()
+
+# Splice Spectra
+refMat <- as.matrix(refs[,1:2151])
+splicedRefMat <- t(apply(refMat, 1, function(x) spliceCorrection(x,
+                                                                 wav = c(350:2500),
+                                                                 splice = c(965,1775))))
+refs <- as.data.frame(cbind(splicedRefMat,refs[,2152:length(refs)]))
+
+# reduce each sample to the mean spectra
+```
+
+```{r Bin DAI}
+# Identify DAI values based on planting group
+DAIDist <- refs %>%
+  group_by(plantingGroup) %>%
+  summarize(DAIs = unique(DAI)) %>%
+  ungroup()
+
+# Produce DAI by Planting group df
+DAIDist <- pivot_wider(data = DAIDist, id_cols = plantingGroup, names_from = DAIs, values_from = DAIs, names_sort = T)
+ tDAIDist <- t(DAIDist)
+
+# Changes to DAI by planting group
+# G = 8 -> 7, 41 -> 42, 50 -> 49
+# H = 34 -> 35, 55 -> 56
+# I = 20 -> 21, 29 - > 28
+# J = 20 -> 21
+# K = 8 -> 7, 15 -> 14, 22 -> 21, 29 -> 28, 36 -> 35
+
+# reassign DAI values
+refs$DAI[refs$plantingGroup == "G" & refs$DAI == "8"] <- 7
+refs$DAI[refs$plantingGroup == "G" & refs$DAI == "41"] <- 42
+refs$DAI[refs$plantingGroup == "G" & refs$DAI == "50"] <- 49
+refs$DAI[refs$plantingGroup == "H" & refs$DAI == "34"] <- 35
+refs$DAI[refs$plantingGroup == "H" & refs$DAI == "55"] <- 56
+refs$DAI[refs$plantingGroup == "I" & refs$DAI == "20"] <- 21
+refs$DAI[refs$plantingGroup == "I" & refs$DAI == "29"] <- 28
+refs$DAI[refs$plantingGroup == "J" & refs$DAI == "20"] <- 21
+refs$DAI[refs$plantingGroup == "K" & refs$DAI == "8"] <- 7
+refs$DAI[refs$plantingGroup == "K" & refs$DAI == "15"] <- 14
+refs$DAI[refs$plantingGroup == "K" & refs$DAI == "22"] <- 21
+refs$DAI[refs$plantingGroup == "K" & refs$DAI == "29"] <- 28
+refs$DAI[refs$plantingGroup == "K" & refs$DAI == "36"] <- 35
+
+# Recheck names to make sure DAIs look correct
+DAIDist2 <- refs %>%
+  group_by(plantingGroup) %>%
+  summarize(DAIs = unique(DAI)) %>%
+  ungroup()
+
+# Produce DAI by Planting group df
+DAIDist2 <- pivot_wider(data = DAIDist2, id_cols = plantingGroup, names_from = DAIs, values_from = DAIs, names_sort = T)
+ tDAIDist2 <- t(DAIDist2)
+```
+
+```{r Define IBRA Functions}
+
+calculate_VIF_matrix <- function(spectral_matrix) {
+  if (!is.numeric(spectral_matrix)) {
+    stop("Input matrix must be numeric.")
+  }
+  
+  n <- ncol(spectral_matrix)
+  vif_matrix <- matrix(NA, nrow = n, ncol = n)
+
+  for (i in 1:n) {
+    for (j in 1:n) {
+      if (i != j) {
+        correlation <- cor(spectral_matrix[, i], spectral_matrix[, j])
+        vif <- 1 / (1 - correlation^2)
+        vif_matrix[i, j] <- vif
+      } else {
+        vif_matrix[i, j] <- NA  # Set diagonal elements to NA
+      }
+    }
+  }
+
+  return(vif_matrix)
+}
+
+vifPair <- function(x, y) {
+  model <- lm(y ~ x)
+  rsq <- summary(model)$r.squared
+  vif <- 1 / (1 - rsq)
+  return(round(vif, 2))
+}
+
+clusters <- function(vif_matrix, threshold) {
+  distances_left <- rep(0, ncol(vif_matrix))
+  distances_right <- rep(0, ncol(vif_matrix))
+
+  for (band in 1:ncol(vif_matrix)) {
+    # Check left
+    d <- 1  # Set initial distance
+    vifVal <- Inf
+    while (vifVal > threshold && (band - d) > 0) {
+      cat("Evaluating band", band, "with a distance", d, "\n")
+      if (vif_matrix[band, band - d] == 0) {
+        vif_matrix[band, band - d] <- vifPair(vif_matrix[, band], vif_matrix[, band - d])
+        vif_matrix[band - d, band] <- vif_matrix[band, band - d]
+      }
+      vifVal <- vif_matrix[band, band - d]
+      d <- d + 1
+    }
+    distances_left[band] <- d - 1
+
+    # Check right
+    d <- 1  # Set initial distance
+    vifVal <- Inf
+    while (vifVal > threshold && (band + d) <= ncol(vif_matrix)) {
+      cat("Evaluating band", band, "with a distance", d, "\n")
+      if (vif_matrix[band, band + d] == 0) {
+        vif_matrix[band, band + d] <- vifPair(vif_matrix[, band], vif_matrix[, band + d])
+        vif_matrix[band + d, band] <- vif_matrix[band, band + d]
+      }
+      vifVal <- vif_matrix[band, band + d]
+      d <- d + 1
+    }
+    distances_right[band] <- d - 1
+  }
+
+  return(list(abs(distances_left - distances_right)))
+}
+```
+
+```{r IBRA Translation - Noisy spectra problems Identified.}
+
+refsT2 <- refs %>% 
+  filter(plantingGroup == "G") %>%
+  filter(DAI == 0) %>%
+  filter(treatment == "control") 
+
+MuT2 <- as.matrix(x = refsT2[1:length(c(350:2500))], ncol = 1:length(c(350:2500)),nrow = , byrow =T )
+
+
+calculate_VIF_matrix <- function(spectral_matrix) {
+  if (!is.numeric(spectral_matrix)) {
+    stop("Input matrix must be numeric.")
+  }
+  
+  n <- ncol(spectral_matrix)
+  vif_matrix <- matrix(NA, nrow = n, ncol = n)
+
+  for (i in 1:n) {
+    for (j in 1:n) {
+      if (i != j) {
+        correlation <- cor(spectral_matrix[, i], spectral_matrix[, j])
+        vif <- 1 / (1 - correlation^2)
+        vif_matrix[i, j] <- vif
+      } else {
+        vif_matrix[i, j] <- NA  # Set diagonal elements to NA
+      }
+    }
+  }
+
+  return(vif_matrix)
+}
+
+vif_matrix <- calculate_VIF_matrix(MuT2)
+
+vifPair <- function(x, y) {
+  model <- lm(y ~ x)
+  rsq <- summary(model)$r.squared
+  vif <- 1 / (1 - rsq)
+  return(round(vif, 2))
+}
+
+clusters <- function(vif_matrix, threshold) {
+  distances_left <- rep(0, ncol(vif_matrix))
+  distances_right <- rep(0, ncol(vif_matrix))
+
+  for (band in 1:ncol(vif_matrix)) {
+    # Check left
+    d <- 1  # Set initial distance
+    vifVal <- Inf
+    while (vifVal > threshold && (band - d) > 0) {
+      cat("Evaluating band", band, "with a distance", d, "\n")
+      if (vif_matrix[band, band - d] == 0) {
+        vif_matrix[band, band - d] <- vifPair(vif_matrix[, band], vif_matrix[, band - d])
+        vif_matrix[band - d, band] <- vif_matrix[band, band - d]
+      }
+      vifVal <- vif_matrix[band, band - d]
+      d <- d + 1
+    }
+    distances_left[band] <- d - 1
+
+    # Check right
+    d <- 1  # Set initial distance
+    vifVal <- Inf
+    while (vifVal > threshold && (band + d) <= ncol(vif_matrix)) {
+      cat("Evaluating band", band, "with a distance", d, "\n")
+      if (vif_matrix[band, band + d] == 0) {
+        vif_matrix[band, band + d] <- vifPair(vif_matrix[, band], vif_matrix[, band + d])
+        vif_matrix[band + d, band] <- vif_matrix[band, band + d]
+      }
+      vifVal <- vif_matrix[band, band + d]
+      d <- d + 1
+    }
+    distances_right[band] <- d - 1
+  }
+
+  return(list(abs(distances_left - distances_right)))
+}
+
+# spectralClusters2 <- clusters(vif_matrix, threshold = 2)
+# spectralClusters8 <- clusters(vif_matrix, threshold = 8)
+# spectralClusters12 <- clusters(vif_matrix, threshold = 12)
+
+# lmm2 <- spatialEco::local.min.max(c(unlist(spectralClusters2[1])), dev = mean, add.points=TRUE, 
+#                        main="Local Minima and Maxima")
+# lmm8 <- spatialEco::local.min.max(c(unlist(spectralClusters8[1])), dev = mean, add.points=TRUE, 
+#                        main="Local Minima and Maxima")
+# lmm12 <- spatialEco::local.min.max(c(unlist(spectralClusters12[1])), dev = mean, add.points=TRUE, 
+#                        main="Local Minima and Maxima")
+
+
+start.time <- Sys.time()
+# specClus2 <- clusters(vif_matrix, threshold = 2)
+specClus8 <- clusters(vif_matrix, threshold = 8)
+# specClus12 <- clusters(vif_matrix, threshold = 12)
+end.time <- Sys.time()
+timeTaken <- round(end.time - start.time,2)
+timeTakenTheta8 <- timeTaken
+# lmm2full <- spatialEco::local.min.max(c(unlist(specClus2[1])), dev = mean, add.points=TRUE,
+                       # main="Local Minima and Maxima")
+lmm8full <- spatialEco::local.min.max(c(unlist(specClus8[1])), dev = mean, add.points=TRUE,
+                       main="Local Minima and Maxima")
+# lmm12full <- spatialEco::local.min.max(c(unlist(specClus12[1])), dev = mean, add.points=TRUE,
+                       # main="Local Minima and Maxima")
+
+
+ploT1 <- as.data.frame(x=matrix(data = c(unlist(specClus8)), nrow = 1), names = c(as.character(350:2500)))
+
+VIFminima <- as.data.frame(rbind(ploT1,MuT2[1,]))
+names(VIFminima) <- c(350:2500)
+VIFminima <- as.data.frame(t(VIFminima))
+VIFminima$V3 <- 350:2500
+names(VIFminima) <- c("VIF","Reflectance","Wavelength")
+ 
+ggplot(VIFminima, aes(x=Wavelength)) + 
+  geom_line(aes(y=(Reflectance)*1100)) + 
+  geom_line(aes(y=VIFminima$VIF)) + scale_y_continuous(
+    name = "VIF", limits = c(0,420),
+    sec.axis = sec_axis(~./1000, name="Reflectance"))  + geom_line(
+    mapping = aes(y = Reflectance*1100),
+    data = VIFminima, colour = 'darkgreen',
+    size = 1.25) + geom_vline(xintercept = 1775, col = "dark red") + ggtitle("IBRA VIF Values Across Control Spectra")
+
+# identify how many Wavelengths have a VIF < 4
+# add point locations to plot
+
+# ID wavelengths based on their VIF value
+theta8VIF <- unlist(specClus8[1])
+names(theta8VIF) <- c(350:2500)
+length(names(theta8VIF)[theta8VIF <= 4])
+
+# Try formatting data to HSDAR applying a smoother to the SWIRII diode
+# Test on leaf spectra
+# *Retry on canopy data but normalize / scale spectra?
+# look at SD of reflectance across wavelengths and remove noisy spectra based on 
+### a threshold. This should be done prior to applying a smoother and IBRA.
+
+# Apply Lowess smoother to third diode and rerun through IBRA
+# However, this might be disputed by editors, prepare version where this diode is omitted.
+```
+
+```{r Smoothers for problem spectra}
+refsCs <- refs %>% 
+  filter(DAI == 0) %>%
+  filter(treatment == "control") 
+
+cRefU <- t(as.data.frame(c(unlist(lapply(refsCs[,1:2151], mean))),names = 350:2500))
+length(cRefU[1,])
+
+# 1775-350 = 1425
+t <-cRefU[1,1426:length(cRefU[1,])]
+lowD3 <- smooth.spline(cRefU[1,1426:length(cRefU[1,])], spar = .75)
+
+smoothComp <- as.data.frame(cbind(lowD3$y,cRefU[1,1426:2151],1775:2500)) %>%
+  setNames(c("Smoothed","Original","Wavelength"))
+
+cor(smoothComp$Original,smoothComp$Smoothed)
+
+ggplot(smoothComp, aes(x=Wavelength)) + 
+  geom_line(aes(y=Original), colour = "purple", size = 1) + 
+  geom_line(aes(y=smoothComp$Smoothed)) + 
+  scale_y_continuous(name = "Reflectance", limits = c(0, 0.2),
+                     sec.axis = sec_axis(~., name = "Reflectance")) + 
+  geom_line(mapping = aes(y = Smoothed), data = smoothComp, colour = 'darkgreen', size = 1.25) + 
+  geom_vline(xintercept = 1775, col = "darkred") + 
+  ggtitle("SWIRII: Mean & Smoothed Spectra (time=0,trt=c,n=52) r-squared = .99") + theme_bw()
+
+# Redo this analysis and use mean spectra from multiple samples to see if the effects of
+# applying the spline change the shape of the spectra. 
+
+# plot(smoothComp$Smoothed,smoothComp$Original, type = "p", cex= .4) + abline(c(0,1), col ="red")
+
+
+```
+
+```{r Smooth SWIR II -> IBRA (t0, rep=G, trt=control)}
+
+refsT <- refs %>% 
+  # filter(plantingGroup == "G") %>%
+  filter(DAI == 56) 
+  # filter(treatment == "control")
+
+MuT <- as.matrix(x = refsT[1:length(c(350:2500))], ncol = 1:length(c(350:2500)),nrow = , byrow =T )
+# Cut SWIR II -> apply smooth.spline -> cbind back with MuT2
+SWIRII <- MuT[,1426:length(MuT[1,])]
+#apply spline
+SWIRIISmooth <- lapply(as.data.frame(t(SWIRII)), smooth.spline, spar = .75)
+# extract smoothed reflectance 'y' and create df
+SWIRIISmoothdf <- data.frame()
+for (i in SWIRIISmooth) {
+  SWIRIISmoothdf <- rbind(SWIRIISmoothdf,i$y)
+}
+swirMat <- as.matrix(SWIRIISmoothdf, ncol = ncol(SWIRIISmoothdf), byrow = F)
+# bind back
+swirMat <- cbind(MuT[,1:1425],swirMat[,1:length(swirMat[1,])])
+
+# plot SWIRII OG reflectance and all spline correct
+matplot(t(swirMat[,1426:2151]), type = "l", ylim = c(0,.23))
+matplot(t(MuT[,1426:2151]), type = "l", ylim = c(0,.23))
+mean(cor(swirMat[,1426:2151],MuT[,1426:2151]))
+
+# mean spectrum from SWIRR splined spectra
+splinedSpectraMu <- colMeans(swirMat)
+# mean spectrum from original
+meanSpectra <- colMeans(MuT)
+# lowD3 <- smooth.spline(MuT[1,1426:length(MuT2[1,])], spar = .75)
+# bind and create wavelength variable
+smoothSWIRIIComp <- as.data.frame(cbind(splinedSpectraMu,meanSpectra,350:2500)) %>%
+  setNames(c("Splined","Mean","Wavelength"))
+
+ggplot(smoothSWIRIIComp, aes(x=Wavelength)) + 
+  geom_line(aes(y=Mean), color = "red",size = 1.25) + 
+  geom_line(aes(y=smoothSWIRIIComp$Splined)) + 
+  scale_y_continuous(name = "Reflectance", limits = c(0, 0.6),
+                     sec.axis = sec_axis(~., name = "Reflectance")) + 
+  geom_line(mapping = aes(y = Splined), data = smoothSWIRIIComp, colour = 'darkgreen', size = 1.25) + ggtitle("Mean Spectra & Smoothed Spectra")
+
+# look at the correlation b/w the og mean and splined data
+# plot error bars 
+
+
+###############################################
+# IBRA on planting group G, DAI = 0, treatment = Control
+
+vif_matrix <- calculate_VIF_matrix(swirMat)
+start.time <- Sys.time()
+specClus8 <- clusters(vif_matrix, threshold = 8)
+end.time <- Sys.time()
+timeTaken <- round(end.time - start.time,2)
+timeTakenTheta8 <- timeTaken
+
+ploT1 <- as.data.frame(x=matrix(data = c(unlist(specClus8)), nrow = 1), names = c(as.character(350:2500)))
+
+VIFminima <- as.data.frame(rbind(ploT1,swirMat[1,]))
+names(VIFminima) <- c(350:2500)
+VIFminima <- as.data.frame(t(VIFminima))
+VIFminima$V3 <- 350:2500
+names(VIFminima) <- c("VIF","Reflectance","Wavelength")
+ write_excel_csv(VIFminima, "C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\all56IBRA_SmoothSpar75.csv") # naming convention = (planting group + DAI + treatment).xlsx
+
+all56IBRA_SmoothSpar75 <- read_csv("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\all56IBRA_SmoothSpar75.csv")
+G0CIBRA_spar75 <- read_csv("C:\\Users\\lochl\\OneDrive - Montana State University\\Documents\\SawflyResearch\\Analysis\\ProximalSensing2023\\IBRA\\G0CIBRA_SmoothSpar75.csv")
+
+# read in data
+VIFminima <- all56IBRA_SmoothSpar75
+# add points to graph
+
+# extract Wavelengths that have a VIF less than 5.
+WavelengthVIF <- VIFminima$Wavelength[VIFminima$VIF < 5]
+VIF4VIF <- VIFminima$VIF[VIFminima$VIF < 5]
+nonRedundandtWaves <- as.data.frame(cbind(WavelengthVIF,VIF4VIF)) %>% set_names(c("Wavelength","VIF"))
+
+# nonRedundandtWaves %>%
+  # filter(Wavelength >481)
+
+
+ggplot(VIFminima, aes(x=Wavelength)) + 
+  geom_line(aes(y=(Reflectance)*2200)) + 
+  geom_line(aes(y=VIFminima$VIF)) + scale_y_continuous(
+    name = "VIF", limits = c(0,900),
+    sec.axis = sec_axis(~./2200, name="Reflectance"))  + geom_line(
+    mapping = aes(y = Reflectance*2200),
+    data = VIFminima, colour = 'darkgreen',
+    size = 1.25) + geom_vline(xintercept = 1775, col = "dark red") + ggtitle("IBRA VIF Values, t=0, n=52, SWIRII smoothed") + geom_point(mapping = aes(x = Wavelength, y =VIF ), data = nonRedundandtWaves, colour = "red", pch = 4) + theme_bw()
+
+
+```
+
+```{r Produce Spectrum of salient waves}
+refsT <- refs %>% 
+  # filter(plantingGroup == "G") %>%
+  filter(DAI == 0) %>%
+  filter(treatment == "control")
+
+MuT <- as.matrix(x = refsT[1:length(c(350:2500))], ncol = 1:length(c(350:2500)),nrow = , byrow =T )
+
+# read in data
+VIFminima <- all0CIBRA_spar75
+# add points to graph
+
+# extract Wavelengths that have a VIF less than 5.
+WavelengthVIF <- VIFminima$Wavelength[VIFminima$VIF < 5]
+VIF4VIF <- VIFminima$VIF[VIFminima$VIF < 5]
+nonRedundandtWaves <- as.data.frame(cbind(WavelengthVIF,VIF4VIF)) %>% set_names(c("Wavelength","VIF"))
+
+salientWaves <- nonRedundandtWaves %>%
+filter(Wavelength > 481)
+
+# match <- colSums(MuT[1] == salientWaves$Wavelength) > 0
+
+# grab salient waves from MuT and populate into dummy spectra
+# create dummy spectrum
+dummySpec <- data.frame(matrix(1,nrow = nrow(MuT), ncol = 2151)) %>% set_names(as.character(350:2500))
+
+# Convert MuT to df first.
+refDf <- as.data.frame(MuT) 
+# refDf %>% select(c(as.character(salientWaves$Wavelength)))
+refDf[,c(as.character(salientWaves$Wavelength))]
+# create index of salient wavelengths
+matchWaves <- intersect(names(dummySpec),unique(salientWaves$Wavelength))
+
+dummySpec[,matchWaves] <- refDf[,c(as.character(salientWaves$Wavelength))]
+# add mean spectra for plotting purposes
+dummySpec <- rbind(colMeans(MuT),dummySpec)
+
+matplot(t(dummySpec[1:nrow(dummySpec),]), type = 'p', pch = 18, cex = .75, ylim = c(.01,.4), main = "Reflectance of Salient Wavelengths (n=52,time=0,trt=control)",sub ="*80 wavelengths total (481nm<)" ,ylab = "Reflectance", xlab = "Wavelength")
+
+
+
+
+```
+
+```{r  3D plot spectrum over time}
+rm(SpecMuByDAI)
+SpecMuByDAI <- refs %>%
+ # filter(plantingGroup %in% c("J","K")) %>%
+  # filter(treatment == "treatment") %>%
+  group_by(DAI) %>%
+   summarize(across(everything(),list(mean)))
+# Rename Wavelengths
+names(SpecMuByDAI)[1:2152] <- c("DAI",c(350:2500))
+# SpecMuByDAI <- SpecMuByDAI[order(SpecMuByDAI$DAI)]
+
+# create 3d plotting df
+ spec3d<- list(as.matrix(SpecMuByDAI[,2:2152]), #z
+               as.numeric(colnames(SpecMuByDAI[2:2152])), #x
+               c(unique(SpecMuByDAI[,1]))) %>% #y
+                set_names(c("z","x","y"))
+row.names(spec3d$z) <- c(sort(SpecMuByDAI$DAI))
+ 
+plot_ly(
+  z = ~ spec3d$z,
+  x = ~ spec3d$x,
+  y = ~ row.names(spec3d$z),
+  colors = c("darkgreen","green","greenyellow","yellow","orange","gray"),
+  type = "surface",
+  colorbar = c(0,.4),
+cmin = 0,cmax = .3) %>% layout(scene = list(
+  # xaxis = list(title = "Wavelength", range = range(spec3d$x)),
+    xaxis = list(title = "Wavelength", range = range(380:2500)),
+  yaxis = list(title = "Days After Infestation", range = range(spec3d$y)),
+  zaxis = list(title = "Reflectance", range = c(0,.6)),
+               colorbar = list(title = "reflectance", cmin = 0, cmax = .5)
+))
+```
+
+```{r 3d plot SWIR}
+SpecMuByDAI <- refs %>%
+ # filter(plantingGroup %in% c("J","K")) %>%
+  # filter(treatment == "treatment") %>%
+  group_by(DAI) %>%
+   summarize(across(everything(),list(mean)))
+# Rename Wavelengths
+names(SpecMuByDAI)[1:2152] <- c("DAI",c(350:2500))
+# SpecMuByDAI <- SpecMuByDAI[order(SpecMuByDAI$DAI)]
+
+# create 3d plotting df
+ spec3d<- list(as.matrix(SpecMuByDAI[,2:2152]), #z
+               as.numeric(colnames(SpecMuByDAI[2:2152])), #x
+               c(unique(SpecMuByDAI[,1]))) %>% #y
+                set_names(c("z","x","y"))
+row.names(spec3d$z) <- c(sort(SpecMuByDAI$DAI))
+ 
+plot_ly(
+  z = ~ spec3d$z,
+  x = ~ spec3d$x,
+  y = ~ row.names(spec3d$z),
+  colors = c("darkblue","blue","lightblue","gray"),
+  type = "surface",
+  colorbar = c(0,.20),
+cmin = 0,cmax = .3) %>% layout(scene = list(
+  # xaxis = list(title = "Wavelength", range = range(spec3d$x)),
+    xaxis = list(title = "Wavelength", range = range(1775:2500)),
+  yaxis = list(title = "Days After Infestation", range = range(spec3d$y)),
+  zaxis = list(title = "Reflectance", range = c(0,.35)),
+               colorbar = list(title = "reflectance", cmin = 0, cmax = .25)
+))
+```
+
+```{r}
+refsCs <- refs %>% 
+  filter(DAI == 0) %>%
+  filter(treatment == "control") 
+
+MuT2 <- as.matrix(x = refsCs[1:length(c(350:2500))], ncol = 1:length(c(350:2500)),nrow = , byrow =T )
+
+
+calculate_VIF_matrix <- function(spectral_matrix) {
+  if (!is.numeric(spectral_matrix)) {
+    stop("Input matrix must be numeric.")
+  }
+  
+  n <- ncol(spectral_matrix)
+  vif_matrix <- matrix(NA, nrow = n, ncol = n)
+
+  for (i in 1:n) {
+    for (j in 1:n) {
+      if (i != j) {
+        correlation <- cor(spectral_matrix[, i], spectral_matrix[, j])
+        vif <- 1 / (1 - correlation^2)
+        vif_matrix[i, j] <- vif
+      } else {
+        vif_matrix[i, j] <- NA  # Set diagonal elements to NA
+      }
+    }
+  }
+
+  return(vif_matrix)
+}
+
+vif_matrix <- calculate_VIF_matrix(MuT2)
+
+start.time <- Sys.time()
+# specClus2 <- clusters(vif_matrix, threshold = 2)
+specClus8 <- clusters(vif_matrix, threshold = 8)
+# specClus12 <- clusters(vif_matrix, threshold = 12)
+end.time <- Sys.time()
+timeTaken <- round(end.time - start.time,2)
+timeTakenTheta8 <- timeTaken
+# lmm2full <- spatialEco::local.min.max(c(unlist(specClus2[1])), dev = mean, add.points=TRUE,
+                       # main="Local Minima and Maxima")
+lmm8full <- spatialEco::local.min.max(c(unlist(specClus8[1])), dev = mean, add.points=TRUE,
+                       main="Local Minima and Maxima")
+# lmm12full <- spatialEco::local.min.max(c(unlist(specClus12[1])), dev = mean, add.points=TRUE,
+                       # main="Local Minima and Maxima")
+
+
+ploT1 <- as.data.frame(x=matrix(data = c(unlist(specClus8)), nrow = 1), names = c(as.character(350:2500)))
+
+VIFminima <- as.data.frame(rbind(ploT1,MuT2[1,]))
+names(VIFminima) <- c(350:2500)
+VIFminima <- as.data.frame(t(VIFminima))
+VIFminima$V3 <- 350:2500
+names(VIFminima) <- c("VIF","Reflectance","Wavelength")
+ 
+ggplot(VIFminima, aes(x=Wavelength)) + 
+  geom_line(aes(y=(Reflectance)*1100)) + 
+  geom_line(aes(y=VIFminima$VIF)) + scale_y_continuous(
+    name = "VIF", limits = c(0,420),
+    sec.axis = sec_axis(~./1000, name="Reflectance"))  + geom_line(
+    mapping = aes(y = Reflectance*1100),
+    data = VIFminima, colour = 'darkgreen',
+    size = 1.25) + geom_vline(xintercept = 1775, col = "dark red") + ggtitle("IBRA VIF Values Across Control Spectra")
+
+# identify how many Wavelengths have a VIF < 4
+# add point locations to plot
+
+# ID wavelengths based on their VIF value
+theta8VIF <- unlist(specClus8[1])
+names(theta8VIF) <- c(350:2500)
+length(names(theta8VIF)[theta8VIF <= 4])
+
+# Try formatting data to HSDAR applying a smoother to the SWIRII diode
+# Test on leaf spectra
+# *Retry on canopy data but normalize / scale spectra?
+# look at SD of reflectance across wavelengths and remove noisy spectra based on 
+### a threshold. This should
+```
+
+```{r SE across spectrum}
+refsCs <- refs %>% 
+  # filter(plantingGroup == "G") %>%
+  filter(DAI == 0) #%>%
+  # filter(treatment == "control") 
+
+MuT2 <- as.matrix(x = refsCs[1:length(c(350:2500))], ncol = 1:length(c(350:2500)),nrow = , byrow =T )
+
+# take mean
+MuCs <- colMeans(MuT2)
+
+# sdtake 
+MuT2Sd <- apply(MuT2, 2, function(x) {
+ sd <- sd(x, na.rm = TRUE)
+  return(sd)
+})
+
+#calculate upper and lower SD bounds
+psd <- MuCs + MuT2Sd
+nsd <- MuCs - MuT2Sd
+
+plot(350:2500, MuCs, ty="l", col="blue", 
+     ylab="Reflectance", 
+     xlab='Wavelength',
+     lty=1,lwd=3, ylim = c(0,.45), main = "Standard Deviation of Reflectance")
+#draw boundary and fill
+lines(350:2500, psd)
+lines(350:2500, nsd)
+polygon(x=c(350:2500, rev(350:2500)), y=c(psd, rev(nsd)), col="purple", density = 90, angle=45)
+#redraw line on top
+lines(350:2500, MuCs, col="darkgreen",lwd=3)
+
+
+
+```
+
+```{r}
+SpecMuByDAI <- refs %>%
+  # filter(plantName %in% c("PJC05"))%>%
+  filter(treatment == "control") %>%
+  group_by(DAI) %>%
+   summarize(across(everything(),list(mean)))
+# Rename Wavelengths
+names(SpecMuByDAI)[1:2152] <- c("DAI",c(350:2500))
+# SpecMuByDAI <- SpecMuByDAI[order(SpecMuByDAI$DAI)]
+
+# create 3d plotting df
+ spec3d<- list(as.matrix(SpecMuByDAI[,2:2152]), #z
+               as.numeric(colnames(SpecMuByDAI[2:2152])), #x
+               c(unique(SpecMuByDAI[,1]))) %>% #y
+                set_names(c("z","x","y"))
+row.names(spec3d$z) <- c(sort(SpecMuByDAI$DAI))
+
+# plotly camera settings
+scene <- list()
+
+plot_ly(
+  z = ~ spec3d$z,
+  x = ~ spec3d$x,
+  y = ~ row.names(spec3d$z),
+  colors = c("darkgreen","green","orange", "gray"),
+  # colors = c("darkgreen","white","purple"),
+  type = "surface",
+  # colorbar = c(0,.4),
+cmin = 0,cmax = .3) %>% layout(scene = list(camera = list(eye = list(x = 1.5, y = -1.7, z = .75)),
+  # xaxis = list(title = "Wavelength", range = range(spec3d$x)),
+    xaxis = list(title = "Wavelength", range = range(380:2500)),
+  yaxis = list(title = "Days After Infestation", range = range(spec3d$y)),
+  zaxis = list(title = "Reflectance", range = c(0,.6))
+               # colorbar = list(title = "reflectance", cmin = 0, cmax = .5)
+))
+
+```
